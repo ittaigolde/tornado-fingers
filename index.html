@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tornado Fingers</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a12; font-family: sans-serif; display: flex; }
+  #scene-container { width: 50%; height: 100vh; position: relative; }
+  #scene-container canvas { display: block; width: 100%; height: 100%; }
+  #cam-container { width: 50%; height: 100vh; position: relative; background: #111; }
+  #webcam { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); display: block; }
+  #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  #status {
+    position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+    color: #8af; font-size: 14px; background: rgba(0,0,0,0.6); padding: 4px 12px;
+    border-radius: 4px; z-index: 10; pointer-events: none;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="scene-container"></div>
+<div id="cam-container">
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div id="status">Initializing...</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ── Constants ──
+const PARTICLE_COUNT = 4000;
+const PARTICLE_RADIUS = 0.045;
+const GLASS_TOP_R = 0.7, GLASS_BOT_R = 0.5, GLASS_H = 2.5;
+const GLASS_Y_BASE = 0.0;
+const FILL_LEVEL = 0.75;
+const MAX_VORTEX = 18.0;
+const GRAVITY = -4.0;
+const IDLE_TIMEOUT = 5000;
+const REPULSION_STRENGTH = 8.0;
+const REPULSION_RADIUS = PARTICLE_RADIUS * 2.2;
+
+// Spatial grid for particle-particle interaction
+const GRID_CELL = REPULSION_RADIUS;
+const grid = new Map();
+
+function gridKey(cx, cy, cz) {
+  return (cx * 73856093 ^ cy * 19349663 ^ cz * 83492791) | 0;
+}
+
+function buildGrid() {
+  grid.clear();
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    if (lives[i] <= 0) continue;
+    const cx = Math.floor(positions[i*3] / GRID_CELL) | 0;
+    const cy = Math.floor(positions[i*3+1] / GRID_CELL) | 0;
+    const cz = Math.floor(positions[i*3+2] / GRID_CELL) | 0;
+    const key = gridKey(cx, cy, cz);
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key).push(i);
+  }
+}
+
+function getNeighbors(i) {
+  const cx = Math.floor(positions[i*3] / GRID_CELL) | 0;
+  const cy = Math.floor(positions[i*3+1] / GRID_CELL) | 0;
+  const cz = Math.floor(positions[i*3+2] / GRID_CELL) | 0;
+  const result = [];
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        const key = gridKey(cx+dx, cy+dy, cz+dz);
+        const cell = grid.get(key);
+        if (cell) {
+          for (const j of cell) {
+            if (j !== i) result.push(j);
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
+// ── State ──
+let state = 'READY';
+let idleStart = 0;
+let vortexStrength = 0;
+let smoothFingerDist = 0;
+let smoothPalmX = 0.5;
+let lightTargetX = 0;
+let handResults = null;
+
+// ── Three.js Setup ──
+const container = document.getElementById('scene-container');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(container.clientWidth, container.clientHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.2;
+container.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0a18);
+
+const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
+camera.position.set(0, 2, 6);
+camera.lookAt(0, GLASS_Y_BASE + GLASS_H * 0.4, 0);
+
+// Lighting
+const ambientLight = new THREE.AmbientLight(0x4466aa, 0.5);
+scene.add(ambientLight);
+
+const dirLight = new THREE.DirectionalLight(0xffeedd, 1.5);
+dirLight.position.set(2, 5, -3);
+dirLight.castShadow = true;
+dirLight.shadow.mapSize.width = 1024;
+dirLight.shadow.mapSize.height = 1024;
+dirLight.shadow.camera.near = 0.5;
+dirLight.shadow.camera.far = 20;
+dirLight.shadow.camera.left = -4;
+dirLight.shadow.camera.right = 4;
+dirLight.shadow.camera.top = 4;
+dirLight.shadow.camera.bottom = -4;
+scene.add(dirLight);
+
+// Table
+const tableMat = new THREE.MeshStandardMaterial({ color: 0x1a1a2e, roughness: 0.8 });
+const table = new THREE.Mesh(new THREE.PlaneGeometry(12, 12), tableMat);
+table.rotation.x = -Math.PI / 2;
+table.position.y = GLASS_Y_BASE;
+table.receiveShadow = true;
+scene.add(table);
+
+// Glass
+const glassGeo = new THREE.CylinderGeometry(GLASS_TOP_R, GLASS_BOT_R, GLASS_H, 32, 1, true);
+const glassMat = new THREE.MeshPhysicalMaterial({
+  color: 0xaaccff, roughness: 0.05, metalness: 0.1,
+  transparent: true, opacity: 0.15, side: THREE.DoubleSide,
+  depthWrite: false,
+});
+const glass = new THREE.Mesh(glassGeo, glassMat);
+glass.position.y = GLASS_Y_BASE + GLASS_H / 2;
+glass.castShadow = true;
+scene.add(glass);
+
+// Glass bottom disc
+const bottomGeo = new THREE.CircleGeometry(GLASS_BOT_R, 32);
+const bottomMat = new THREE.MeshPhysicalMaterial({
+  color: 0xffffff, roughness: 0.05,
+  transparent: true, opacity: 0.15, side: THREE.DoubleSide,
+});
+const bottom = new THREE.Mesh(bottomGeo, bottomMat);
+bottom.rotation.x = -Math.PI / 2;
+bottom.position.y = GLASS_Y_BASE + 0.01;
+scene.add(bottom);
+
+// ── Water Particles as InstancedMesh (spheres with volume) ──
+const sphereGeo = new THREE.SphereGeometry(PARTICLE_RADIUS, 8, 6);
+const sphereMat = new THREE.MeshPhysicalMaterial({
+  color: 0x4488dd,
+  roughness: 0.1,
+  metalness: 0.0,
+  transparent: true,
+  opacity: 0.55,
+  depthWrite: true,
+  ior: 1.33,
+});
+const waterMesh = new THREE.InstancedMesh(sphereGeo, sphereMat, PARTICLE_COUNT);
+waterMesh.castShadow = true;
+waterMesh.receiveShadow = true;
+waterMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+scene.add(waterMesh);
+
+const dummy = new THREE.Object3D();
+
+const positions = new Float32Array(PARTICLE_COUNT * 3);
+const velocities = new Float32Array(PARTICLE_COUNT * 3);
+const lives = new Float32Array(PARTICLE_COUNT);
+const inGlass = new Uint8Array(PARTICLE_COUNT);
+
+function glassRadiusAtY(y) {
+  const t = Math.max(0, Math.min(1, (y - GLASS_Y_BASE) / GLASS_H));
+  return GLASS_BOT_R + (GLASS_TOP_R - GLASS_BOT_R) * t;
+}
+
+function initParticles() {
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const fillH = GLASS_H * FILL_LEVEL;
+    const y = GLASS_Y_BASE + PARTICLE_RADIUS + Math.random() * fillH;
+    const r = glassRadiusAtY(y) * 0.85 * Math.sqrt(Math.random());
+    const theta = Math.random() * Math.PI * 2;
+    positions[i * 3] = Math.cos(theta) * r;
+    positions[i * 3 + 1] = y;
+    positions[i * 3 + 2] = Math.sin(theta) * r;
+    velocities[i * 3] = 0;
+    velocities[i * 3 + 1] = 0;
+    velocities[i * 3 + 2] = 0;
+    lives[i] = 1.0;
+    inGlass[i] = 1;
+  }
+}
+initParticles();
+
+function updateInstanceMatrix() {
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    if (lives[i] <= 0) {
+      dummy.position.set(0, -100, 0); // hide dead particles
+      dummy.scale.setScalar(0);
+    } else {
+      dummy.position.set(positions[i*3], positions[i*3+1], positions[i*3+2]);
+      dummy.scale.setScalar(1);
+    }
+    dummy.updateMatrix();
+    waterMesh.setMatrixAt(i, dummy.matrix);
+  }
+  waterMesh.instanceMatrix.needsUpdate = true;
+}
+
+// ── Particle Physics ──
+function updateParticles(dt) {
+  dt = Math.min(dt, 0.025);
+  const damping = state === 'ACTIVE' ? 0.97 : 0.90;
+
+  // Build spatial grid for repulsion
+  buildGrid();
+
+  // Compute repulsion forces
+  const forces = new Float32Array(PARTICLE_COUNT * 3);
+
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    if (lives[i] <= 0) continue;
+    const ix = i*3, iy = i*3+1, iz = i*3+2;
+    const px = positions[ix], py = positions[iy], pz = positions[iz];
+
+    const neighbors = getNeighbors(i);
+    for (const j of neighbors) {
+      const jx = j*3, jy = j*3+1, jz = j*3+2;
+      const dx = px - positions[jx];
+      const dy = py - positions[jy];
+      const dz = pz - positions[jz];
+      const distSq = dx*dx + dy*dy + dz*dz;
+      const rr = REPULSION_RADIUS;
+      if (distSq < rr * rr && distSq > 0.0001) {
+        const dist = Math.sqrt(distSq);
+        const overlap = rr - dist;
+        const strength = REPULSION_STRENGTH * overlap / rr;
+        const nx = dx / dist, ny = dy / dist, nz = dz / dist;
+        forces[ix] += nx * strength;
+        forces[iy] += ny * strength;
+        forces[iz] += nz * strength;
+      }
+    }
+  }
+
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    if (lives[i] <= 0) continue;
+
+    const ix = i*3, iy = i*3+1, iz = i*3+2;
+    let px = positions[ix], py = positions[iy], pz = positions[iz];
+    let vx = velocities[ix], vy = velocities[iy], vz = velocities[iz];
+
+    // Gravity
+    vy += GRAVITY * dt;
+
+    // Repulsion from neighbors
+    vx += forces[ix] * dt;
+    vy += forces[iy] * dt;
+    vz += forces[iz] * dt;
+
+    // Vortex force
+    if (vortexStrength > 0.1) {
+      const dx = px;
+      const dz = pz;
+      const dist = Math.sqrt(dx * dx + dz * dz) + 0.01;
+      const falloff = 1.0 / (1.0 + dist * dist * 2.0);
+      const str = vortexStrength * falloff * dt;
+
+      // tangential rotation
+      vx += -dz / dist * str * 3.0;
+      vz += dx / dist * str * 3.0;
+      // upward pull
+      vy += str * 2.5;
+      // slight inward pull
+      vx -= dx / dist * str * 0.5;
+      vz -= dz / dist * str * 0.5;
+    }
+
+    // Damping
+    vx *= damping;
+    vy *= damping;
+    vz *= damping;
+
+    // Integrate
+    px += vx * dt;
+    py += vy * dt;
+    pz += vz * dt;
+
+    // Check if a falling particle enters the glass
+    if (!inGlass[i]) {
+      if (py <= GLASS_Y_BASE + GLASS_H && py >= GLASS_Y_BASE) {
+        const r = glassRadiusAtY(py);
+        const distXZ = Math.sqrt(px * px + pz * pz);
+        if (distXZ < r * 0.9) {
+          inGlass[i] = 1;
+        }
+      }
+    }
+
+    // Glass collision
+    if (inGlass[i]) {
+      const r = glassRadiusAtY(py);
+      const distXZ = Math.sqrt(px * px + pz * pz);
+      const wallLimit = r - PARTICLE_RADIUS;
+
+      // Wall collision
+      if (distXZ > wallLimit) {
+        const nx = px / distXZ;
+        const nz = pz / distXZ;
+        px = nx * wallLimit;
+        pz = nz * wallLimit;
+        const dot = vx * nx + vz * nz;
+        vx -= 1.5 * dot * nx;
+        vz -= 1.5 * dot * nz;
+      }
+
+      // Bottom collision
+      if (py < GLASS_Y_BASE + PARTICLE_RADIUS) {
+        py = GLASS_Y_BASE + PARTICLE_RADIUS;
+        vy = Math.abs(vy) * 0.2;
+      }
+
+      // Check if particle escaped over the top
+      if (py > GLASS_Y_BASE + GLASS_H + 0.3) {
+        inGlass[i] = 0;
+      }
+    }
+
+    // Out of bounds check
+    if (py < -5 || py > 15 || Math.abs(px) > 8 || Math.abs(pz) > 8) {
+      lives[i] = 0;
+    }
+
+    positions[ix] = px; positions[iy] = py; positions[iz] = pz;
+    velocities[ix] = vx; velocities[iy] = vy; velocities[iz] = vz;
+
+    // life decay when outside glass
+    if (!inGlass[i]) {
+      lives[i] -= dt * 0.2;
+      if (lives[i] < 0) lives[i] = 0;
+    }
+  }
+
+  updateInstanceMatrix();
+}
+
+// ── Refill ──
+function refillParticles() {
+  let inGlassCount = 0;
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    if (inGlass[i] && lives[i] > 0) inGlassCount++;
+  }
+  if (inGlassCount >= PARTICLE_COUNT * FILL_LEVEL) {
+    state = 'READY';
+    statusEl.textContent = 'Ready - show two pointer fingers';
+    return;
+  }
+
+  let spawned = 0;
+  for (let i = 0; i < PARTICLE_COUNT && spawned < 8; i++) {
+    if (lives[i] <= 0) {
+      const faucetX = (Math.random() - 0.5) * 0.15;
+      const faucetZ = (Math.random() - 0.5) * 0.15;
+      positions[i * 3] = faucetX;
+      positions[i * 3 + 1] = GLASS_Y_BASE + GLASS_H + 1.5;
+      positions[i * 3 + 2] = faucetZ;
+      velocities[i * 3] = 0;
+      velocities[i * 3 + 1] = -4.0;
+      velocities[i * 3 + 2] = 0;
+      lives[i] = 1.0;
+      inGlass[i] = 0;
+      spawned++;
+    }
+  }
+}
+
+// ── Webcam ──
+const video = document.getElementById('webcam');
+const overlayCanvas = document.getElementById('overlay');
+const overlayCtx = overlayCanvas.getContext('2d');
+const statusEl = document.getElementById('status');
+
+async function setupCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: 'user' }
+    });
+    video.srcObject = stream;
+    await new Promise(r => video.onloadedmetadata = r);
+    video.play();
+    overlayCanvas.width = video.videoWidth;
+    overlayCanvas.height = video.videoHeight;
+    statusEl.textContent = 'Camera ready, loading hand tracking...';
+    return true;
+  } catch (e) {
+    statusEl.textContent = 'Camera access denied. Show two pointer fingers to control vortex.';
+    console.error('Camera error:', e);
+    return false;
+  }
+}
+
+// ── MediaPipe Hand Tracking ──
+let handLandmarker = null;
+
+async function setupHandTracking() {
+  try {
+    const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs');
+    const { HandLandmarker, FilesetResolver } = vision;
+
+    const fileset = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm'
+    );
+    handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU'
+      },
+      runningMode: 'VIDEO',
+      numHands: 2,
+    });
+    statusEl.textContent = 'Ready - show two pointer fingers to control vortex';
+  } catch (e) {
+    console.error('Hand tracking error:', e);
+    statusEl.textContent = 'Hand tracking failed to load';
+  }
+}
+
+// ── Gesture Detection ──
+function isFingerExtended(landmarks, tipIdx, pipIdx) {
+  return landmarks[tipIdx].y < landmarks[pipIdx].y;
+}
+
+function isPointerGesture(landmarks) {
+  const indexExtended = isFingerExtended(landmarks, 8, 6);
+  const middleCurled = !isFingerExtended(landmarks, 12, 10);
+  const ringCurled = !isFingerExtended(landmarks, 16, 14);
+  const pinkyCurled = !isFingerExtended(landmarks, 20, 18);
+  return indexExtended && middleCurled && ringCurled && pinkyCurled;
+}
+
+function isOpenPalm(landmarks) {
+  return isFingerExtended(landmarks, 8, 6) &&
+         isFingerExtended(landmarks, 12, 10) &&
+         isFingerExtended(landmarks, 16, 14) &&
+         isFingerExtended(landmarks, 20, 18);
+}
+
+function processHands(results) {
+  handResults = results;
+  if (!results || !results.landmarks || results.landmarks.length === 0) {
+    if (state === 'ACTIVE') {
+      state = 'IDLE';
+      idleStart = performance.now();
+      statusEl.textContent = 'Idle - particles settling...';
+    }
+    vortexStrength *= 0.9;
+    return;
+  }
+
+  const hands = results.landmarks;
+  let pointerTips = [];
+  let palmHand = null;
+
+  for (const hand of hands) {
+    if (isPointerGesture(hand)) {
+      pointerTips.push(hand[8]);
+    } else if (isOpenPalm(hand)) {
+      palmHand = hand;
+    }
+  }
+
+  if (pointerTips.length >= 2) {
+    const dx = pointerTips[0].x - pointerTips[1].x;
+    const dy = pointerTips[0].y - pointerTips[1].y;
+    const rawDist = Math.sqrt(dx * dx + dy * dy);
+
+    smoothFingerDist = smoothFingerDist * 0.7 + rawDist * 0.3;
+
+    const normalized = Math.max(0, Math.min(1, smoothFingerDist / 0.6));
+    const targetStrength = Math.pow(1 - normalized, 2) * MAX_VORTEX;
+    vortexStrength = vortexStrength * 0.7 + targetStrength * 0.3;
+
+    if (state !== 'ACTIVE') {
+      state = 'ACTIVE';
+    }
+    statusEl.textContent = `Vortex: ${Math.round(vortexStrength / MAX_VORTEX * 100)}%`;
+  } else if (palmHand) {
+    const rawPalmX = palmHand[0].x;
+    smoothPalmX = smoothPalmX * 0.7 + rawPalmX * 0.3;
+    lightTargetX = (1 - smoothPalmX) * 10 - 5;
+
+    if (state === 'ACTIVE') {
+      state = 'IDLE';
+      idleStart = performance.now();
+    }
+    vortexStrength *= 0.95;
+    statusEl.textContent = 'Palm detected - moving light';
+  } else {
+    if (state === 'ACTIVE') {
+      state = 'IDLE';
+      idleStart = performance.now();
+      statusEl.textContent = 'Idle - particles settling...';
+    }
+    vortexStrength *= 0.9;
+  }
+}
+
+// ── Overlay Drawing ──
+function drawOverlay() {
+  overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+  if (!handResults || !handResults.landmarks) return;
+
+  const w = overlayCanvas.width;
+  const h = overlayCanvas.height;
+
+  let pointerTips = [];
+
+  for (const hand of handResults.landmarks) {
+    overlayCtx.fillStyle = 'rgba(100, 200, 255, 0.3)';
+    for (const lm of hand) {
+      const x = (1 - lm.x) * w;
+      const y = lm.y * h;
+      overlayCtx.beginPath();
+      overlayCtx.arc(x, y, 2, 0, Math.PI * 2);
+      overlayCtx.fill();
+    }
+
+    if (isPointerGesture(hand)) {
+      const tip = hand[8];
+      pointerTips.push({ x: (1 - tip.x) * w, y: tip.y * h });
+    }
+  }
+
+  if (pointerTips.length >= 2) {
+    overlayCtx.save();
+    overlayCtx.strokeStyle = '#00ffff';
+    overlayCtx.lineWidth = 3;
+    overlayCtx.shadowColor = '#00ffff';
+    overlayCtx.shadowBlur = 15;
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(pointerTips[0].x, pointerTips[0].y);
+    overlayCtx.lineTo(pointerTips[1].x, pointerTips[1].y);
+    overlayCtx.stroke();
+
+    overlayCtx.fillStyle = '#00ffff';
+    for (const tip of pointerTips) {
+      overlayCtx.beginPath();
+      overlayCtx.arc(tip.x, tip.y, 6, 0, Math.PI * 2);
+      overlayCtx.fill();
+    }
+    overlayCtx.restore();
+  }
+}
+
+// ── State Machine ──
+function updateState() {
+  if (state === 'IDLE') {
+    if (performance.now() - idleStart > IDLE_TIMEOUT) {
+      state = 'REFILLING';
+      statusEl.textContent = 'Refilling glass...';
+    }
+  }
+  if (state === 'REFILLING') {
+    refillParticles();
+  }
+
+  dirLight.position.x += (lightTargetX - dirLight.position.x) * 0.05;
+}
+
+// ── Resize ──
+function onResize() {
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+  if (video.videoWidth) {
+    overlayCanvas.width = video.videoWidth;
+    overlayCanvas.height = video.videoHeight;
+  }
+}
+window.addEventListener('resize', onResize);
+
+// ── Main Loop ──
+let lastTime = 0;
+let lastHandTime = -1;
+
+function animate(time) {
+  requestAnimationFrame(animate);
+  const dt = lastTime ? (time - lastTime) / 1000 : 0.016;
+  lastTime = time;
+
+  if (handLandmarker && video.readyState >= 2) {
+    const ts = performance.now();
+    if (ts !== lastHandTime) {
+      try {
+        const results = handLandmarker.detectForVideo(video, ts);
+        processHands(results);
+      } catch (e) { /* skip frame */ }
+      lastHandTime = ts;
+    }
+  }
+
+  updateState();
+  updateParticles(dt);
+  drawOverlay();
+  renderer.render(scene, camera);
+}
+
+// ── Init ──
+async function init() {
+  const camOk = await setupCamera();
+  if (camOk) {
+    await setupHandTracking();
+  }
+  updateInstanceMatrix(); // show initial state
+  requestAnimationFrame(animate);
+}
+
+init();
+</script>
+</body>
+</html>
